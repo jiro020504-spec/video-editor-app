@@ -250,6 +250,32 @@
   </div>
 
   <div class="card">
+    <h2 class="section-title">3. BGMを追加(任意)</h2>
+    <button class="btn btn-secondary" id="bgmPickBtn" type="button">BGMを追加</button>
+    <input type="file" id="bgmInput" accept="audio/*">
+    <div id="bgmInfo" style="display:none;margin-top:10px;">
+      <div class="item-name" id="bgmName" style="white-space:normal;"></div>
+      <button class="btn-danger-small" id="bgmRemoveBtn" type="button" style="margin-top:6px;">BGMを削除</button>
+      <div id="bgmOptions" style="margin-top:14px;">
+        <label class="hint" style="display:block;margin-bottom:6px;">元の動画の音声</label>
+        <div style="display:flex;flex-direction:column;gap:6px;margin-bottom:14px;">
+          <label style="display:flex;align-items:center;gap:6px;font-size:13px;">
+            <input type="radio" name="bgmAudioMode" id="bgmModeKeep" value="keep" checked>
+            音声を残す(BGMは控えめに重ねる)
+          </label>
+          <label style="display:flex;align-items:center;gap:6px;font-size:13px;">
+            <input type="radio" name="bgmAudioMode" id="bgmModeOnly" value="only">
+            音声を消してBGMだけにする
+          </label>
+        </div>
+        <label class="hint" style="display:block;margin-bottom:6px;">BGM音量: <span id="bgmVolLabel">30%</span></label>
+        <input type="range" id="bgmVolRange" min="0" max="150" value="30" style="width:100%;accent-color:#6F7563;">
+      </div>
+    </div>
+    <p class="hint">動画全体の長さに合わせて自動でループ/カットされます。</p>
+  </div>
+
+  <div class="card">
     <div class="row" style="margin-bottom:8px;">
       <button class="btn btn-secondary" id="previewBtn" type="button">プレビュー再生</button>
     </div>
@@ -297,7 +323,15 @@
   var MAX_TOTAL_BYTES = 500 * 1024 * 1024; // 500MB
   var MAX_TOTAL_SECONDS = 180; // 3 min
   var TARGET_FPS = 30;
-  var XFADE_DURATION = 0.4; // seconds, crossfade length between clips
+  var XFADE_DURATION = 0.7; // seconds, crossfade length between clips (0.6-0.8s)
+  var BRIGHTNESS_CLAMP = 0.25; // max eq=brightness correction per clip
+  var BGM_VOL_WITH_AUDIO = 30; // default BGM volume (%) when original audio is kept
+  var BGM_VOL_ONLY = 80; // default BGM volume (%) when original audio is replaced
+
+  var bgmFile = null;
+  var bgmKeepOriginalAudio = true;
+  var bgmVolume = BGM_VOL_WITH_AUDIO;
+  var bgmVolumeDirty = false;
 
   var els = {
     pickBtn: document.getElementById('pickBtn'),
@@ -306,6 +340,15 @@
     emptyMsg: document.getElementById('emptyMsg'),
     previewBtn: document.getElementById('previewBtn'),
     exportBtn: document.getElementById('exportBtn'),
+    bgmPickBtn: document.getElementById('bgmPickBtn'),
+    bgmInput: document.getElementById('bgmInput'),
+    bgmInfo: document.getElementById('bgmInfo'),
+    bgmName: document.getElementById('bgmName'),
+    bgmRemoveBtn: document.getElementById('bgmRemoveBtn'),
+    bgmModeKeep: document.getElementById('bgmModeKeep'),
+    bgmModeOnly: document.getElementById('bgmModeOnly'),
+    bgmVolRange: document.getElementById('bgmVolRange'),
+    bgmVolLabel: document.getElementById('bgmVolLabel'),
     errorBanner: document.getElementById('errorBanner'),
     warnBanner: document.getElementById('warnBanner'),
     previewModal: document.getElementById('previewModal'),
@@ -626,6 +669,49 @@
   els.previewBtn.addEventListener('click', openPreview);
   els.previewClose.addEventListener('click', closePreview);
 
+  // ---------- BGM ----------
+  els.bgmPickBtn.addEventListener('click', function () { els.bgmInput.click(); });
+
+  els.bgmInput.addEventListener('change', function (e) {
+    clearError();
+    var file = (e.target.files || [])[0];
+    e.target.value = '';
+    if (!file) return;
+    if (file.type.indexOf('audio/') !== 0) {
+      showError('音楽ファイルを選んでください。');
+      return;
+    }
+    bgmFile = file;
+    els.bgmName.textContent = 'BGM: ' + file.name;
+    els.bgmInfo.style.display = 'block';
+    applyBgmVolumeDefault();
+  });
+
+  els.bgmRemoveBtn.addEventListener('click', function () {
+    bgmFile = null;
+    els.bgmInfo.style.display = 'none';
+  });
+
+  function applyBgmVolumeDefault() {
+    if (bgmVolumeDirty) return;
+    bgmVolume = bgmKeepOriginalAudio ? BGM_VOL_WITH_AUDIO : BGM_VOL_ONLY;
+    els.bgmVolRange.value = String(bgmVolume);
+    els.bgmVolLabel.textContent = bgmVolume + '%';
+  }
+
+  els.bgmModeKeep.addEventListener('change', function () {
+    if (els.bgmModeKeep.checked) { bgmKeepOriginalAudio = true; applyBgmVolumeDefault(); }
+  });
+  els.bgmModeOnly.addEventListener('change', function () {
+    if (els.bgmModeOnly.checked) { bgmKeepOriginalAudio = false; applyBgmVolumeDefault(); }
+  });
+
+  els.bgmVolRange.addEventListener('input', function () {
+    bgmVolumeDirty = true;
+    bgmVolume = parseInt(els.bgmVolRange.value, 10) || 0;
+    els.bgmVolLabel.textContent = bgmVolume + '%';
+  });
+
   // ---------- Export (ffmpeg.wasm) ----------
   var ffmpegInstance = null;
   var ffmpegLoadingPromise = null;
@@ -766,9 +852,44 @@
     return out;
   }
 
+  // Downsamples the given PNG bytes and returns their average luma (0-255),
+  // used for the simple auto brightness-leveling between clips.
+  function pngBytesToAverageLuma(bytes) {
+    return new Promise(function (resolve, reject) {
+      var blob = new Blob([bytes.buffer ? bytes.buffer : bytes], { type: 'image/png' });
+      var url = URL.createObjectURL(blob);
+      var img = new Image();
+      img.onload = function () {
+        try {
+          var w = Math.min(img.naturalWidth || 160, 160);
+          var scale = w / (img.naturalWidth || w);
+          var h = Math.max(1, Math.round((img.naturalHeight || w) * scale));
+          var canvas = document.createElement('canvas');
+          canvas.width = w;
+          canvas.height = h;
+          var ctx = canvas.getContext('2d');
+          ctx.drawImage(img, 0, 0, w, h);
+          var data = ctx.getImageData(0, 0, w, h).data;
+          var sum = 0, count = 0;
+          for (var i = 0; i < data.length; i += 4) {
+            sum += 0.299 * data[i] + 0.587 * data[i + 1] + 0.114 * data[i + 2];
+            count++;
+          }
+          URL.revokeObjectURL(url);
+          resolve(count ? sum / count : 128);
+        } catch (err) {
+          URL.revokeObjectURL(url);
+          reject(err);
+        }
+      };
+      img.onerror = function () { URL.revokeObjectURL(url); reject(new Error('画像の解析に失敗しました')); };
+      img.src = url;
+    });
+  }
+
   function validateBeforeExport() {
     if (!items.length) return 'まず動画・写真を追加してください。';
-    var totalBytes = items.reduce(function (s, it) { return s + it.file.size; }, 0);
+    var totalBytes = items.reduce(function (s, it) { return s + it.file.size; }, 0) + (bgmFile ? bgmFile.size : 0);
     if (totalBytes > MAX_TOTAL_BYTES) {
       return '合計ファイルサイズが大きすぎます(' + Math.round(totalBytes / 1024 / 1024) + 'MB)。500MB以下になるように減らしてください。';
     }
@@ -794,7 +915,8 @@
   function runExport() {
     els.resultCard.style.display = 'none';
     var n = items.length;
-    totalUnits = n + (n > 1 ? 1 : 0); // +1 for the final crossfade merge step
+    var hasBgm = !!bgmFile;
+    totalUnits = n + (n > 1 ? 1 : 0) + (hasBgm ? 1 : 0);
     completedUnits = 0;
     currentSegProgress = 0;
     els.progressTitle.textContent = '書き出し中...';
@@ -803,20 +925,63 @@
     var createdFiles = [];
     var ffmpeg;
     var durations = items.map(itemDuration);
+    var photoPngCache = {};
 
     return getFFmpeg().then(function (fx) {
       ffmpeg = fx;
       var target = computeTargetResolution();
       var vf = buildVf(target.w, target.h, TARGET_FPS);
-      var chain = Promise.resolve();
+
+      // Phase 1: measure each clip's average brightness so we can gently
+      // level out clips that are noticeably darker/brighter than the rest.
+      setProgress(0, '明るさを確認しています...');
+      var lumas = new Array(n);
+      var measureChain = Promise.resolve();
 
       items.forEach(function (item, i) {
-        chain = chain.then(function () {
-          setProgress(i, ((i + 1) + ' / ' + n) + ' 個目を処理中... (' + (item.type === 'video' ? '動画' : '写真') + ')');
-          var segName = 'seg' + i + '.mp4';
-
+        measureChain = measureChain.then(function () {
           if (item.type === 'image') {
             return imageToPngBytes(item, target.w, target.h).then(function (bytes) {
+              photoPngCache[i] = bytes;
+              return pngBytesToAverageLuma(bytes);
+            });
+          }
+          var inName = 'in' + i + (guessExt(item.file.name) || '.mp4');
+          return fileToUint8Array(item.file).then(function (bytes) {
+            return ffmpeg.writeFile(inName, bytes);
+          }).then(function () {
+            createdFiles.push(inName);
+            var dur = item.duration || 0.5;
+            var t = Math.max(0, Math.min(dur / 2, Math.max(0, dur - 0.05)));
+            var frameName = 'bframe' + i + '.png';
+            return ffmpeg.exec(['-ss', String(t), '-i', inName, '-frames:v', '1', frameName]).then(function () {
+              return ffmpeg.readFile(frameName);
+            }).then(function (data) {
+              var p = ffmpeg.deleteFile(frameName);
+              if (p && p.catch) p.catch(function () { /* ignore */ });
+              return pngBytesToAverageLuma(data);
+            });
+          });
+        }).then(function (luma) {
+          lumas[i] = luma;
+        }).catch(function () {
+          lumas[i] = 128; // couldn't measure: assume mid-gray, skip correction
+        });
+      });
+
+      return measureChain.then(function () {
+        var targetLuma = lumas.reduce(function (s, v) { return s + v; }, 0) / n;
+        var chain = Promise.resolve();
+
+        items.forEach(function (item, i) {
+          chain = chain.then(function () {
+            setProgress(i, ((i + 1) + ' / ' + n) + ' 個目を処理中... (' + (item.type === 'video' ? '動画' : '写真') + ')');
+            var segName = 'seg' + i + '.mp4';
+            var delta = Math.max(-BRIGHTNESS_CLAMP, Math.min(BRIGHTNESS_CLAMP, (targetLuma - lumas[i]) / 255));
+            var itemVf = vf + (Math.abs(delta) > 0.003 ? ',eq=brightness=' + delta.toFixed(4) : '');
+
+            if (item.type === 'image') {
+              var bytes = photoPngCache[i];
               var imgName = 'img' + i + '.png';
               return ffmpeg.writeFile(imgName, bytes).then(function () {
                 createdFiles.push(imgName);
@@ -825,7 +990,7 @@
                   '-f', 'lavfi', '-i', 'anullsrc=r=44100:cl=stereo',
                   '-t', String(item.seconds),
                   '-r', String(TARGET_FPS), '-pix_fmt', 'yuv420p',
-                  '-vf', vf,
+                  '-vf', itemVf,
                   '-map', '0:v', '-map', '1:a',
                   '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '23',
                   '-c:a', 'aac', '-ar', '44100', '-ac', '2', '-shortest',
@@ -834,76 +999,102 @@
               }).then(function () {
                 createdFiles.push(segName);
               });
-            });
-          } else {
-            var inName = 'in' + i + (guessExt(item.file.name) || '.mp4');
-            return fileToUint8Array(item.file).then(function (bytes) {
-              return ffmpeg.writeFile(inName, bytes);
-            }).then(function () {
-              createdFiles.push(inName);
-              return probeHasAudio(ffmpeg, inName);
-            }).then(function (hasAudio) {
-              if (hasAudio) {
+            } else {
+              var inName = 'in' + i + (guessExt(item.file.name) || '.mp4');
+              return probeHasAudio(ffmpeg, inName).then(function (hasAudio) {
+                if (hasAudio) {
+                  return ffmpeg.exec([
+                    '-i', inName,
+                    '-vf', itemVf,
+                    '-map', '0:v', '-map', '0:a',
+                    '-pix_fmt', 'yuv420p',
+                    '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '23',
+                    '-c:a', 'aac', '-ar', '44100', '-ac', '2',
+                    segName
+                  ]);
+                }
                 return ffmpeg.exec([
                   '-i', inName,
-                  '-vf', vf,
-                  '-map', '0:v', '-map', '0:a',
+                  '-f', 'lavfi', '-t', String(item.duration || 0.1), '-i', 'anullsrc=r=44100:cl=stereo',
+                  '-vf', itemVf,
+                  '-map', '0:v', '-map', '1:a',
                   '-pix_fmt', 'yuv420p',
                   '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '23',
-                  '-c:a', 'aac', '-ar', '44100', '-ac', '2',
+                  '-c:a', 'aac', '-ar', '44100', '-ac', '2', '-shortest',
                   segName
                 ]);
-              }
-              return ffmpeg.exec([
-                '-i', inName,
-                '-f', 'lavfi', '-t', String(item.duration || 0.1), '-i', 'anullsrc=r=44100:cl=stereo',
-                '-vf', vf,
-                '-map', '0:v', '-map', '1:a',
-                '-pix_fmt', 'yuv420p',
-                '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '23',
-                '-c:a', 'aac', '-ar', '44100', '-ac', '2', '-shortest',
-                segName
-              ]);
-            }).then(function () {
-              createdFiles.push(segName);
-            });
-          }
+              }).then(function () {
+                createdFiles.push(segName);
+                var p = ffmpeg.deleteFile(inName);
+                if (p && p.catch) p.catch(function () { /* ignore */ });
+              });
+            }
+          });
         });
-      });
 
-      chain = chain.then(function () {
-        if (n === 1) return;
-        setProgress(n, 'クロスフェードでつないでいます...');
-        var xfDurs = computeXfadeDurations(durations, XFADE_DURATION);
-        var filterParts = [];
-        var cum = durations[0];
-        var prevV = '0:v', prevA = '0:a';
-        for (var k = 0; k < n - 1; k++) {
-          var xf = xfDurs[k];
-          var offset = Math.max(0, cum - xf);
-          var vOut = 'v' + (k + 1), aOut = 'a' + (k + 1);
-          filterParts.push('[' + prevV + '][' + (k + 1) + ':v]xfade=transition=fade:duration=' + xf.toFixed(3) + ':offset=' + offset.toFixed(3) + '[' + vOut + ']');
-          filterParts.push('[' + prevA + '][' + (k + 1) + ':a]acrossfade=d=' + xf.toFixed(3) + ':c1=tri:c2=tri[' + aOut + ']');
-          cum = cum + durations[k + 1] - xf;
-          prevV = vOut;
-          prevA = aOut;
-        }
-        var inputArgs = [];
-        for (var i = 0; i < n; i++) { inputArgs.push('-i', 'seg' + i + '.mp4'); }
-        return ffmpeg.exec(inputArgs.concat([
-          '-filter_complex', filterParts.join(';'),
-          '-map', '[' + prevV + ']', '-map', '[' + prevA + ']',
-          '-r', String(TARGET_FPS), '-pix_fmt', 'yuv420p',
-          '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '23',
-          '-c:a', 'aac', '-ar', '44100', '-ac', '2',
-          'output.mp4'
-        ]));
-      });
+        var mergedName = n === 1 ? 'seg0.mp4' : 'output.mp4';
+        var totalDuration = durations[0];
 
-      return chain.then(function () {
-        var finalName = n === 1 ? 'seg0.mp4' : 'output.mp4';
-        createdFiles.push(finalName);
-        return ffmpeg.readFile(finalName);
+        chain = chain.then(function () {
+          if (n === 1) return;
+          setProgress(n, 'クロスフェードでつないでいます...');
+          var xfDurs = computeXfadeDurations(durations, XFADE_DURATION);
+          var filterParts = [];
+          var cum = durations[0];
+          var prevV = '0:v', prevA = '0:a';
+          for (var k = 0; k < n - 1; k++) {
+            var xf = xfDurs[k];
+            var offset = Math.max(0, cum - xf);
+            var vOut = 'v' + (k + 1), aOut = 'a' + (k + 1);
+            filterParts.push('[' + prevV + '][' + (k + 1) + ':v]xfade=transition=fade:duration=' + xf.toFixed(3) + ':offset=' + offset.toFixed(3) + '[' + vOut + ']');
+            filterParts.push('[' + prevA + '][' + (k + 1) + ':a]acrossfade=d=' + xf.toFixed(3) + ':c1=tri:c2=tri[' + aOut + ']');
+            cum = cum + durations[k + 1] - xf;
+            prevV = vOut;
+            prevA = aOut;
+          }
+          totalDuration = cum;
+          var inputArgs = [];
+          for (var i = 0; i < n; i++) { inputArgs.push('-i', 'seg' + i + '.mp4'); }
+          return ffmpeg.exec(inputArgs.concat([
+            '-filter_complex', filterParts.join(';'),
+            '-map', '[' + prevV + ']', '-map', '[' + prevA + ']',
+            '-r', String(TARGET_FPS), '-pix_fmt', 'yuv420p',
+            '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '23',
+            '-c:a', 'aac', '-ar', '44100', '-ac', '2',
+            mergedName
+          ]));
+        });
+
+        chain = chain.then(function () {
+          createdFiles.push(mergedName);
+          if (!hasBgm) return;
+          setProgress(n + (n > 1 ? 1 : 0), 'BGMをミックスしています...');
+          var bgmName = 'bgm' + (guessExt(bgmFile.name) || '.mp3');
+          return fileToUint8Array(bgmFile).then(function (bytes) {
+            return ffmpeg.writeFile(bgmName, bytes);
+          }).then(function () {
+            createdFiles.push(bgmName);
+            var vol = Math.max(0, bgmVolume) / 100;
+            var filterC = bgmKeepOriginalAudio
+              ? '[1:a]volume=' + vol.toFixed(3) + '[bgm];[0:a][bgm]amix=inputs=2:duration=first:dropout_transition=0:normalize=0[aout]'
+              : '[1:a]volume=' + vol.toFixed(3) + '[aout]';
+            return ffmpeg.exec([
+              '-i', mergedName, '-stream_loop', '-1', '-i', bgmName,
+              '-filter_complex', filterC,
+              '-map', '0:v', '-map', '[aout]',
+              '-t', String(totalDuration),
+              '-c:v', 'copy', '-c:a', 'aac', '-ar', '44100', '-ac', '2',
+              'bgmmixed.mp4'
+            ]);
+          }).then(function () {
+            createdFiles.push('bgmmixed.mp4');
+            mergedName = 'bgmmixed.mp4';
+          });
+        });
+
+        return chain.then(function () {
+          return ffmpeg.readFile(mergedName);
+        });
       });
     }).then(function (data) {
       setProgress(totalUnits, '仕上げています...');
