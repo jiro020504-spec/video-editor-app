@@ -296,6 +296,8 @@
   var RECOMMENDED_MAX = 6;
   var MAX_TOTAL_BYTES = 500 * 1024 * 1024; // 500MB
   var MAX_TOTAL_SECONDS = 180; // 3 min
+  var TARGET_FPS = 30;
+  var XFADE_DURATION = 0.4; // seconds, crossfade length between clips
 
   var els = {
     pickBtn: document.getElementById('pickBtn'),
@@ -630,6 +632,7 @@
   var currentSegProgress = 0;
   var totalUnits = 1;
   var completedUnits = 0;
+  var ffmpegLogBuffer = [];
 
   function toBlobURL(url, mimeType) {
     return fetch(url).then(function (res) {
@@ -663,6 +666,10 @@
       if (p > 1) p = 1;
       currentSegProgress = p;
       renderProgress();
+    });
+    ffmpeg.on('log', function (e) {
+      ffmpegLogBuffer.push((e && e.message) || '');
+      if (ffmpegLogBuffer.length > 500) ffmpegLogBuffer.shift();
     });
 
     ffmpegLoadingPromise = Promise.all([
@@ -732,6 +739,33 @@
     });
   }
 
+  function probeHasAudio(ffmpeg, filename) {
+    var startLen = ffmpegLogBuffer.length;
+    return ffmpeg.exec(['-i', filename]).catch(function () { /* expected: no output specified */ }).then(function () {
+      var slice = ffmpegLogBuffer.slice(startLen);
+      return slice.some(function (l) { return /Stream #0:\d+.*Audio:/.test(l); });
+    });
+  }
+
+  function buildVf(w, h, fps) {
+    return 'scale=' + w + ':' + h + ':force_original_aspect_ratio=decrease,pad=' + w + ':' + h + ':(ow-iw)/2:(oh-ih)/2,setsar=1,fps=' + fps;
+  }
+
+  function itemDuration(item) {
+    return item.type === 'video' ? (item.duration || 0) : item.seconds;
+  }
+
+  // For each adjacent pair, pick a crossfade length that never exceeds 40% of
+  // either neighbouring clip's duration, so the xfade offset stays positive.
+  function computeXfadeDurations(durations, base) {
+    var out = [];
+    for (var i = 0; i < durations.length - 1; i++) {
+      var maxAllowed = Math.min(durations[i], durations[i + 1]) * 0.4;
+      out.push(Math.max(0.01, Math.min(base, maxAllowed)));
+    }
+    return out;
+  }
+
   function validateBeforeExport() {
     if (!items.length) return 'まず動画・写真を追加してください。';
     var totalBytes = items.reduce(function (s, it) { return s + it.file.size; }, 0);
@@ -759,7 +793,8 @@
 
   function runExport() {
     els.resultCard.style.display = 'none';
-    totalUnits = items.length + 1; // +1 for final concat step
+    var n = items.length;
+    totalUnits = n + (n > 1 ? 1 : 0); // +1 for the final crossfade merge step
     completedUnits = 0;
     currentSegProgress = 0;
     els.progressTitle.textContent = '書き出し中...';
@@ -767,17 +802,19 @@
 
     var createdFiles = [];
     var ffmpeg;
+    var durations = items.map(itemDuration);
 
     return getFFmpeg().then(function (fx) {
       ffmpeg = fx;
       var target = computeTargetResolution();
+      var vf = buildVf(target.w, target.h, TARGET_FPS);
       var chain = Promise.resolve();
-      var listLines = [];
 
       items.forEach(function (item, i) {
         chain = chain.then(function () {
-          setProgress(i, ((i + 1) + ' / ' + items.length) + ' 個目を処理中... (' + (item.type === 'video' ? '動画' : '写真') + ')');
+          setProgress(i, ((i + 1) + ' / ' + n) + ' 個目を処理中... (' + (item.type === 'video' ? '動画' : '写真') + ')');
           var segName = 'seg' + i + '.mp4';
+
           if (item.type === 'image') {
             return imageToPngBytes(item, target.w, target.h).then(function (bytes) {
               var imgName = 'img' + i + '.png';
@@ -785,14 +822,17 @@
                 createdFiles.push(imgName);
                 return ffmpeg.exec([
                   '-loop', '1', '-i', imgName,
+                  '-f', 'lavfi', '-i', 'anullsrc=r=44100:cl=stereo',
                   '-t', String(item.seconds),
-                  '-r', '25', '-an', '-pix_fmt', 'yuv420p',
+                  '-r', String(TARGET_FPS), '-pix_fmt', 'yuv420p',
+                  '-vf', vf,
+                  '-map', '0:v', '-map', '1:a',
                   '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '23',
+                  '-c:a', 'aac', '-ar', '44100', '-ac', '2', '-shortest',
                   segName
                 ]);
               }).then(function () {
                 createdFiles.push(segName);
-                listLines.push("file '" + segName + "'");
               });
             });
           } else {
@@ -801,37 +841,72 @@
               return ffmpeg.writeFile(inName, bytes);
             }).then(function () {
               createdFiles.push(inName);
-              var vf = 'scale=' + target.w + ':' + target.h + ':force_original_aspect_ratio=decrease,pad=' + target.w + ':' + target.h + ':(ow-iw)/2:(oh-ih)/2,setsar=1';
+              return probeHasAudio(ffmpeg, inName);
+            }).then(function (hasAudio) {
+              if (hasAudio) {
+                return ffmpeg.exec([
+                  '-i', inName,
+                  '-vf', vf,
+                  '-map', '0:v', '-map', '0:a',
+                  '-pix_fmt', 'yuv420p',
+                  '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '23',
+                  '-c:a', 'aac', '-ar', '44100', '-ac', '2',
+                  segName
+                ]);
+              }
               return ffmpeg.exec([
                 '-i', inName,
+                '-f', 'lavfi', '-t', String(item.duration || 0.1), '-i', 'anullsrc=r=44100:cl=stereo',
                 '-vf', vf,
-                '-r', '25', '-an', '-pix_fmt', 'yuv420p',
+                '-map', '0:v', '-map', '1:a',
+                '-pix_fmt', 'yuv420p',
                 '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '23',
+                '-c:a', 'aac', '-ar', '44100', '-ac', '2', '-shortest',
                 segName
               ]);
             }).then(function () {
               createdFiles.push(segName);
-              listLines.push("file '" + segName + "'");
             });
           }
         });
       });
 
       chain = chain.then(function () {
-        setProgress(items.length, '動画を結合中...');
-        var listBytes = new TextEncoder().encode(listLines.join('\n'));
-        return ffmpeg.writeFile('list.txt', listBytes).then(function () {
-          createdFiles.push('list.txt');
-          return ffmpeg.exec(['-f', 'concat', '-safe', '0', '-i', 'list.txt', '-c', 'copy', 'output.mp4']);
-        });
+        if (n === 1) return;
+        setProgress(n, 'クロスフェードでつないでいます...');
+        var xfDurs = computeXfadeDurations(durations, XFADE_DURATION);
+        var filterParts = [];
+        var cum = durations[0];
+        var prevV = '0:v', prevA = '0:a';
+        for (var k = 0; k < n - 1; k++) {
+          var xf = xfDurs[k];
+          var offset = Math.max(0, cum - xf);
+          var vOut = 'v' + (k + 1), aOut = 'a' + (k + 1);
+          filterParts.push('[' + prevV + '][' + (k + 1) + ':v]xfade=transition=fade:duration=' + xf.toFixed(3) + ':offset=' + offset.toFixed(3) + '[' + vOut + ']');
+          filterParts.push('[' + prevA + '][' + (k + 1) + ':a]acrossfade=d=' + xf.toFixed(3) + ':c1=tri:c2=tri[' + aOut + ']');
+          cum = cum + durations[k + 1] - xf;
+          prevV = vOut;
+          prevA = aOut;
+        }
+        var inputArgs = [];
+        for (var i = 0; i < n; i++) { inputArgs.push('-i', 'seg' + i + '.mp4'); }
+        return ffmpeg.exec(inputArgs.concat([
+          '-filter_complex', filterParts.join(';'),
+          '-map', '[' + prevV + ']', '-map', '[' + prevA + ']',
+          '-r', String(TARGET_FPS), '-pix_fmt', 'yuv420p',
+          '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '23',
+          '-c:a', 'aac', '-ar', '44100', '-ac', '2',
+          'output.mp4'
+        ]));
       });
 
       return chain.then(function () {
-        createdFiles.push('output.mp4');
-        return ffmpeg.readFile('output.mp4');
+        var finalName = n === 1 ? 'seg0.mp4' : 'output.mp4';
+        createdFiles.push(finalName);
+        return ffmpeg.readFile(finalName);
       });
     }).then(function (data) {
-      setProgress(items.length + 1, '仕上げています...');
+      setProgress(totalUnits, '仕上げています...');
       var blob = new Blob([data.buffer], { type: 'video/mp4' });
       cleanupFiles(ffmpeg, createdFiles);
       closeProgressModal();
