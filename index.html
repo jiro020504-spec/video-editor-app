@@ -837,6 +837,20 @@
     return 'scale=' + w + ':' + h + ':force_original_aspect_ratio=decrease,pad=' + w + ':' + h + ':(ow-iw)/2:(oh-ih)/2,setsar=1,fps=' + fps;
   }
 
+  // Slow, subtle zoom-in (Ken Burns) for still photos, so the cut to/from a
+  // moving video doesn't feel like a sudden freeze. `d` (frames per zoompan
+  // input pull) MUST equal the total output frame count here -- with a
+  // `-loop 1` image input, leaving d at its default causes zoompan to pull a
+  // "new" input frame every output frame and the zoom accumulator never
+  // advances, so the image ends up perfectly static.
+  function buildKenBurnsVf(w, h, fps, durationSec) {
+    var frames = Math.max(2, Math.round(durationSec * fps));
+    var endZoom = 1.12;
+    var inc = (endZoom - 1) / frames;
+    return "zoompan=z='min(zoom+" + inc.toFixed(6) + "," + endZoom + ")':" +
+      "x='(iw-iw/zoom)/2':y='(ih-ih/zoom)/2':d=" + frames + ':s=' + w + 'x' + h + ':fps=' + fps;
+  }
+
   function itemDuration(item) {
     return item.type === 'video' ? (item.duration || 0) : item.seconds;
   }
@@ -978,7 +992,8 @@
             setProgress(i, ((i + 1) + ' / ' + n) + ' 個目を処理中... (' + (item.type === 'video' ? '動画' : '写真') + ')');
             var segName = 'seg' + i + '.mp4';
             var delta = Math.max(-BRIGHTNESS_CLAMP, Math.min(BRIGHTNESS_CLAMP, (targetLuma - lumas[i]) / 255));
-            var itemVf = vf + (Math.abs(delta) > 0.003 ? ',eq=brightness=' + delta.toFixed(4) : '');
+            var brightnessSuffix = Math.abs(delta) > 0.003 ? ',eq=brightness=' + delta.toFixed(4) : '';
+            var itemVf = (item.type === 'image' ? buildKenBurnsVf(target.w, target.h, TARGET_FPS, item.seconds) : vf) + brightnessSuffix;
 
             if (item.type === 'image') {
               var bytes = photoPngCache[i];
